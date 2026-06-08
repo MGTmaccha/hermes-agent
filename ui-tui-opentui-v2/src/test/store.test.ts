@@ -191,6 +191,19 @@ describe('session store — subagents (Phase 5e agents dashboard)', () => {
     expect(store.state.subagents[0]).toMatchObject({ status: 'complete', summary: 'found it' })
   })
 
+  test('accumulates a live trace per subagent (item 15) + transient thought', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'subagent.start', payload: { subagent_id: 'a1', goal: 'crunch data' } })
+    store.apply({ type: 'subagent.thinking', payload: { subagent_id: 'a1', text: 'considering options' } })
+    store.apply({ type: 'subagent.tool', payload: { subagent_id: 'a1', tool_name: 'web_search', text: 'opentui' } })
+    store.apply({ type: 'subagent.progress', payload: { subagent_id: 'a1', text: 'found 3 hits' } })
+    store.apply({ type: 'subagent.complete', payload: { subagent_id: 'a1', summary: 'done crunching' } })
+    const sa = store.state.subagents[0]!
+    // thinking text is transient (not in the trace), the rest is a concise log
+    expect(sa.thought).toBe('considering options')
+    expect(sa.trace).toEqual(['▶ crunch data', '⚡ web_search — opentui', 'found 3 hits', '✓ done crunching'])
+  })
+
   test('clearTranscript also clears subagents', () => {
     const store = createSessionStore()
     store.apply({ type: 'subagent.start', payload: { subagent_id: 'a1', goal: 'g' } })

@@ -103,7 +103,14 @@ export interface SubagentInfo {
   parentId?: string
   summary?: string
   lastTool?: string
+  /** Live activity trace (item 15) — tool/progress/summary lines, newest last. */
+  trace?: string[]
+  /** Latest thinking text (transient; not appended to the trace to avoid flooding). */
+  thought?: string
 }
+
+/** Cap on a subagent's retained trace lines. */
+const SUBAGENT_TRACE_LIMIT = 200
 
 /**
  * Live session chrome (the status bar — item 14). Sourced from the `session.info`
@@ -562,6 +569,17 @@ export function createSessionStore() {
             const tool = readStr(event.payload, 'tool_name')
             if (tool) sa.lastTool = tool
             sa.status = readStr(event.payload, 'status') ?? subagentStatusFor(event.type)
+
+            // Live trace (item 15): a concise per-subagent activity log. Thinking
+            // deltas update a transient `thought` (not appended — they'd flood).
+            const text = readStr(event.payload, 'text')
+            const trace = (sa.trace ??= [])
+            if (event.type === 'subagent.start') trace.push(`▶ ${goal ?? sa.goal ?? 'started'}`)
+            else if (event.type === 'subagent.tool' && tool) trace.push(`⚡ ${tool}${text ? ` — ${text}` : ''}`)
+            else if (event.type === 'subagent.progress' && text) trace.push(text)
+            else if (event.type === 'subagent.complete') trace.push(`✓ ${summary ?? 'done'}`)
+            else if (event.type === 'subagent.thinking' && text) sa.thought = text
+            if (trace.length > SUBAGENT_TRACE_LIMIT) trace.splice(0, trace.length - SUBAGENT_TRACE_LIMIT)
           })
         )
         break

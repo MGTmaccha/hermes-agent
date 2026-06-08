@@ -213,7 +213,7 @@ describe('App render (Phase 1, themed)', () => {
       type: 'subagent.start',
       payload: { subagent_id: 'a1', goal: 'research the topic', model: 'haiku', depth: 0 }
     })
-    store.apply({ type: 'subagent.tool', payload: { subagent_id: 'a1', tool_name: 'web_search' } })
+    store.apply({ type: 'subagent.tool', payload: { subagent_id: 'a1', tool_name: 'web_search', text: 'opentui' } })
     store.openDashboard()
 
     const frame = await captureFrame(
@@ -222,12 +222,13 @@ describe('App render (Phase 1, themed)', () => {
           <App store={store} />
         </ThemeProvider>
       ),
-      { until: 'Agents', width: 72, height: 18 }
+      { until: 'Agents', width: 72, height: 24 }
     )
 
     expect(frame).toContain('Agents') // dashboard header
-    expect(frame).toContain('research the topic') // subagent goal
-    expect(frame).toContain('web_search') // its last tool
+    expect(frame).toContain('research the topic') // subagent goal (list + detail header)
+    expect(frame).toContain('web_search') // last tool + live trace line (item 15)
+    expect(frame).toContain('select') // footer hint "↑↓ select"
     expect(frame).not.toContain('parent turn') // transcript replaced by the dashboard
   })
 })

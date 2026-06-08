@@ -224,6 +224,17 @@ const skillsCmd: ClientHandler = async (_arg, ctx) => {
   })
 }
 
+/** `/tools` — fetch the tool roster from the gateway and show it in the pager (navigable). */
+const toolsCmd: ClientHandler = async (arg, ctx) => {
+  const command = arg.trim() ? `tools ${arg.trim()}` : 'tools'
+  try {
+    const r = await ctx.request('slash.exec', { command, session_id: ctx.sessionId() })
+    ctx.openPager('Tools', readStr(r, 'output') || '(no tool info)')
+  } catch (error) {
+    ctx.pushSystem(`/tools: ${error instanceof Error ? error.message : 'failed'}`)
+  }
+}
+
 /** The TUI-only client commands (run in-process, never hit the gateway). */
 const CLIENT: Record<string, ClientHandler> = {
   agents: (_arg, ctx) => ctx.openDashboard(),
@@ -236,6 +247,7 @@ const CLIENT: Record<string, ClientHandler> = {
   skills: skillsCmd,
   switch: openSwitcher,
   tasks: (_arg, ctx) => ctx.openDashboard(),
+  tools: toolsCmd,
   help: async (_arg, ctx) => {
     // Prefer the live catalog; fall back to the client list if it's unavailable.
     try {

@@ -1,62 +1,70 @@
 /**
- * fuzzy.ts tests (Epic 7) — the pure scorer + filter + grouped-rows helpers
- * behind the model picker v2: subsequence matching, ranking (prefix >
- * word-boundary > scattered), multi-field (provider/model/lab), empty query =
- * catalog order, no-match = empty, header rows non-selectable, and the
- * flat arrow-traversal order across groups.
+ * fuzzy.ts tests (Epic 7) — the fuzzysort-backed filter + grouped-rows helpers
+ * behind the picker overlays: subsequence matching, ranking (prefix >
+ * word-boundary > scattered), multi-field (provider/model/lab), multi-term AND,
+ * empty query = catalog order, no-match = empty, header rows non-selectable,
+ * the flat arrow-traversal order across groups, and long/messy haystacks shaped
+ * like the resume-session picker (titles + cwd paths + sources).
+ *
+ * Matching/ranking comes from `fuzzysort` via the adapter in logic/fuzzy.ts —
+ * all matching assertions go through the public `fuzzyFilter` (the old
+ * hand-rolled scorer internals `scoreTerm`/`scoreFields` are gone).
  */
 import { describe, expect, test } from 'vitest'
 
-import { buildPickerRows, fuzzyFilter, scoreFields, scoreTerm, visibleRows, type FuzzyField } from '../logic/fuzzy.ts'
+import { buildPickerRows, fuzzyFilter, visibleRows, type FuzzyField } from '../logic/fuzzy.ts'
 
-describe('scoreTerm — subsequence matching', () => {
-  test('matches subsequences (case-insensitive), null when not a subsequence', () => {
-    expect(scoreTerm('son', 'claude-sonnet-4')).not.toBeNull()
-    expect(scoreTerm('son4', 'claude-sonnet-4')).not.toBeNull() // the complaint's example
-    expect(scoreTerm('SON', 'claude-sonnet-4')).not.toBeNull()
-    expect(scoreTerm('xyz', 'claude-sonnet-4')).toBeNull()
-    expect(scoreTerm('sonn5', 'claude-sonnet-4')).toBeNull() // 5 not present after sonn
-    expect(scoreTerm('', 'anything')).toBe(0) // empty term matches everything
+/** Filter plain labels (the single-field degenerate case). */
+const byLabel = (query: string, labels: string[]): string[] => fuzzyFilter(query, labels, l => [{ text: l, weight: 2 }])
+
+describe('fuzzyFilter — subsequence matching', () => {
+  test('matches subsequences (case-insensitive), drops non-subsequences', () => {
+    expect(byLabel('son', ['claude-sonnet-4'])).toEqual(['claude-sonnet-4'])
+    expect(byLabel('son4', ['claude-sonnet-4'])).toEqual(['claude-sonnet-4']) // the complaint's example
+    expect(byLabel('SON', ['claude-sonnet-4'])).toEqual(['claude-sonnet-4'])
+    expect(byLabel('xyz', ['claude-sonnet-4'])).toEqual([])
+    expect(byLabel('sonn5', ['claude-sonnet-4'])).toEqual([]) // 5 not present after sonn
+    expect(byLabel('', ['anything'])).toEqual(['anything']) // empty query matches everything
   })
 
   test('ranking: prefix > word-boundary > scattered', () => {
-    const prefix = scoreTerm('son', 'sonnet')!
-    const boundary = scoreTerm('son', 'claude-sonnet')!
-    const scattered = scoreTerm('son', 'meson')!
-    expect(prefix).toBeGreaterThan(boundary)
-    expect(boundary).toBeGreaterThan(scattered)
+    // catalog order is deliberately worst-first; ranking must invert it.
+    expect(byLabel('son', ['meson', 'claude-sonnet', 'sonnet'])).toEqual(['sonnet', 'claude-sonnet', 'meson'])
   })
 
   test('anchors at the BEST occurrence, not greedily at the first', () => {
-    // greedy-from-first-char would match s@0 then o/n far away; the boundary
-    // anchor at the second `s` (start of "sonnet") must win.
-    expect(scoreTerm('son', 'saturn-sonnet')!).toBeGreaterThanOrEqual(scoreTerm('son', 'claude-sonnet')!)
+    // greedy-from-first-char would match saturn's s@0 then o/n far away; the
+    // boundary anchor at the second `s` (start of "sonnet") must win over a
+    // genuinely scattered match.
+    expect(byLabel('son', ['meson', 'saturn-sonnet'])).toEqual(['saturn-sonnet', 'meson'])
   })
 })
 
-describe('scoreFields — multi-field, multi-term', () => {
-  const fields: FuzzyField[] = [
-    { text: 'claude-sonnet-4', weight: 2 }, // model id (label ×2)
-    { text: 'anthropic' }, // provider slug
-    { text: 'Anthropic' } // lab/display name
+describe('fuzzyFilter — multi-field, multi-term', () => {
+  const row = { lab: 'Anthropic', label: 'claude-sonnet-4', provider: 'anthropic' }
+  const fieldsOf = (r: typeof row): FuzzyField[] => [
+    { text: r.label, weight: 2 },
+    { text: r.provider },
+    { text: r.lab }
   ]
 
   test('a term may match ANY field (provider/model/lab)', () => {
-    expect(scoreFields('son4', fields)).not.toBeNull() // via the model id
-    expect(scoreFields('anthro', fields)).not.toBeNull() // via the provider
-    expect(scoreFields('nope', fields)).toBeNull()
+    expect(fuzzyFilter('son4', [row], fieldsOf)).toHaveLength(1) // via the model id
+    expect(fuzzyFilter('anthro', [row], fieldsOf)).toHaveLength(1) // via the provider
+    expect(fuzzyFilter('nope', [row], fieldsOf)).toHaveLength(0)
   })
 
   test('every whitespace term must match some field (anthropic son works)', () => {
-    expect(scoreFields('anthropic son', fields)).not.toBeNull()
-    expect(scoreFields('anthropic zzz', fields)).toBeNull()
+    expect(fuzzyFilter('anthropic son', [row], fieldsOf)).toHaveLength(1)
+    expect(fuzzyFilter('anthropic zzz', [row], fieldsOf)).toHaveLength(0)
   })
 
-  test('label matches outrank same-quality group matches (weight 2×)', () => {
-    const labelHit = scoreFields('claude', fields)!
-    const providerHit = scoreFields('claude', [{ text: 'other-model', weight: 2 }, { text: 'claude' }])
-    expect(providerHit).not.toBeNull()
-    expect(labelHit).toBeGreaterThan(providerHit!)
+  test('label matches outrank same-quality secondary-field matches (weight 2×)', () => {
+    const labelHit = { label: 'claude-sonnet-4', provider: 'anthropic' }
+    const providerHit = { label: 'other-model', provider: 'claude' }
+    const fields = (r: typeof labelHit): FuzzyField[] => [{ text: r.label, weight: 2 }, { text: r.provider }]
+    // providerHit comes FIRST in catalog order; the ×2 label hit must beat it.
+    expect(fuzzyFilter('claude', [providerHit, labelHit], fields)[0]).toBe(labelHit)
   })
 })
 
@@ -92,9 +100,83 @@ describe('fuzzyFilter', () => {
     expect(hits.map(h => h.label)).toContain('gpt-5')
   })
 
-  test('ties keep catalog order (stable)', () => {
+  test('equal-quality prefix matches rank the shorter label first; true ties keep catalog order', () => {
+    // DELIBERATE expectation change with the fuzzysort adapter: the old scorer
+    // scored both `claude-*` labels identically and fell back to catalog order
+    // (sonnet first). fuzzysort additionally rewards how much of the target the
+    // match covers, so the SHORTER claude-opus-4 now outranks claude-sonnet-4 —
+    // better for a user: the closer-to-exact label surfaces first.
     const hits = fuzzyFilter('claude', CATALOG, rowFields)
-    expect(hits.map(h => h.label)).toEqual(['claude-sonnet-4', 'claude-opus-4'])
+    expect(hits.map(h => h.label)).toEqual(['claude-opus-4', 'claude-sonnet-4'])
+    // genuinely equal scores (same-length labels, same match shape) stay stable
+    // in catalog order — fuzzysort's own sort is unstable; the adapter re-ties.
+    expect(byLabel('son', ['claude-sonnet', 'saturn-sonnet'])).toEqual(['claude-sonnet', 'saturn-sonnet'])
+    expect(byLabel('son', ['saturn-sonnet', 'claude-sonnet'])).toEqual(['saturn-sonnet', 'claude-sonnet'])
+  })
+})
+
+/** Rows shaped like the upcoming resume-session picker: long human titles,
+ *  deep cwd paths and a source tag as secondary haystacks. */
+interface Session {
+  title: string
+  cwd: string
+  source: string
+}
+const SESSIONS: Session[] = [
+  {
+    cwd: '/home/daimon/github/worktrees/hermes-agent/lively-thrush',
+    source: 'tui',
+    title: 'Adopt OpenTUI paradigm for UI implementation'
+  },
+  { cwd: '/home/daimon/github/opentui', source: 'tui', title: 'Fix memory leak in Ink renderer' },
+  { cwd: '/home/daimon/github/daimon-nous', source: 'discord', title: 'Triage daimon-nous webhook reviewer pipeline' },
+  { cwd: '/home/daimon/github/worktrees/hermes-agent/quiet-finch', source: 'tui', title: 'Parser cleanup pass' },
+  { cwd: '/home/daimon/notes', source: 'telegram', title: 'Resume-session picker design notes' }
+]
+const sessionFields = (s: Session): FuzzyField[] => [{ text: s.title, weight: 2 }, { text: s.cwd }, { text: s.source }]
+
+describe('fuzzyFilter — long/messy haystacks (resume-session shape)', () => {
+  test('`opentui par` ANDs across one long title (word-boundary terms)', () => {
+    const hits = fuzzyFilter('opentui par', SESSIONS, sessionFields)
+    expect(hits.map(h => h.title)).toEqual(['Adopt OpenTUI paradigm for UI implementation'])
+  })
+
+  test('`lively` matches via the cwd-path haystack alone', () => {
+    const hits = fuzzyFilter('lively', SESSIONS, sessionFields)
+    expect(hits.map(h => h.title)).toEqual(['Adopt OpenTUI paradigm for UI implementation'])
+  })
+
+  test('`worktr herm` ANDs across deep path segments, keeps ONLY worktree sessions', () => {
+    const hits = fuzzyFilter('worktr herm', SESSIONS, sessionFields)
+    expect(hits.map(h => h.title).sort()).toEqual([
+      'Adopt OpenTUI paradigm for UI implementation',
+      'Parser cleanup pass'
+    ])
+  })
+
+  test('a title hit outranks a path-only hit for the same query', () => {
+    // 'Fix memory leak…' matches `opentui` ONLY via its cwd; the title hit
+    // (label ×2) must come first even though the path row is earlier in catalog.
+    const hits = fuzzyFilter('opentui', SESSIONS, sessionFields)
+    expect(hits.map(h => h.title)).toEqual([
+      'Adopt OpenTUI paradigm for UI implementation',
+      'Fix memory leak in Ink renderer'
+    ])
+  })
+
+  test('a noisy shared path prefix does not drown a title match', () => {
+    // every github row shares /home/daimon/…; the title containing `daimon`
+    // (the daimon-nous session) must outrank the rows matching only via cwd.
+    const hits = fuzzyFilter('daimon', SESSIONS, sessionFields)
+    expect(hits[0]?.title).toBe('Triage daimon-nous webhook reviewer pipeline')
+    expect(hits.length).toBe(SESSIONS.length) // all rows match somewhere (path/source)
+  })
+
+  test('multi-term over title words: `resume pick` pins the picker-design session; junk → empty', () => {
+    expect(fuzzyFilter('resume pick', SESSIONS, sessionFields).map(h => h.title)).toEqual([
+      'Resume-session picker design notes'
+    ])
+    expect(fuzzyFilter('github.zzz', SESSIONS, sessionFields)).toEqual([])
   })
 })
 

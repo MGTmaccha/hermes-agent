@@ -1,16 +1,26 @@
 /**
  * fuzzy.ts — pure fuzzy filtering + grouped presentation for picker overlays
- * (Epic 7 model picker v2). No deps: a ~subsequence scorer in the spirit of
- * opencode's fuzzysort usage (multi-key scoring, title weighted 2×, grouped
- * headers) at the scale we need (≤ a few hundred catalog rows).
+ * (Epic 7 model picker v2; resume-session picker; skills hub). Matching/ranking
+ * is delegated to `fuzzysort` (the library opencode uses in production, see its
+ * dialog-select.tsx) through a thin adapter that preserves this module's API:
+ * call sites pass weighted `FuzzyField[]` haystacks and get back a ranked list.
  *
- * Scoring model (per term, per field): a case-insensitive subsequence match
- * where consecutive runs, string-prefix and word-boundary starts score high and
- * gaps/late starts are penalized — so for `son`: `sonnet` (prefix) >
- * `claude-sonnet` (boundary) > `meson` (scattered). A query is split on
- * whitespace; EVERY term must match at least one field (best field wins, its
- * weight applied), so `anthropic son` works across provider+model fields.
+ * Adapter semantics on top of fuzzysort:
+ * - Multi-key scoring à la opencode: each field is a fuzzysort key; the final
+ *   score is the weight-multiplied SUM of per-key scores (label conventionally
+ *   ×2, opencode's `r[0].score * 2 + r[1].score`), so label hits outrank
+ *   equal-quality group/slug hits.
+ * - Multi-term AND (a feature of the old hand-rolled scorer that fuzzysort
+ *   lacks natively): the query is whitespace-split and fuzzysort runs once per
+ *   term over the progressively-filtered pool — every term must match at least
+ *   one field; per-term scores accumulate. Chosen over a joined single needle
+ *   because it keeps `anthropic son` / `copilot son` matching ACROSS fields.
+ * - Empty/blank query → all items in catalog order (fuzzysort returns nothing
+ *   for an empty needle; the old all-rows behavior is preserved here).
+ * - Equal final scores keep catalog order (fuzzysort's sort is not stable; the
+ *   adapter re-sorts with the original index as tie-break).
  */
+import fuzzysort from 'fuzzysort'
 
 /** One searchable field of an item (e.g. model id ×2, provider slug, lab name). */
 export interface FuzzyField {
@@ -19,91 +29,50 @@ export interface FuzzyField {
   weight?: number
 }
 
-/** Word-boundary characters inside catalog-ish ids/names. */
-const BOUNDARY = new Set([' ', '-', '_', '.', '/', ':', '@', '(', ')'])
-
-/** Cap on alternative start positions tried for the first term char. */
-const MAX_STARTS = 8
-
-/** Greedy subsequence score from a fixed start index; null when it can't match. */
-function scoreFrom(term: string, hay: string, start: number): number | null {
-  let score = 0
-  let prev = -1
-  let from = start
-  for (let qi = 0; qi < term.length; qi++) {
-    const idx = hay.indexOf(term.charAt(qi), from)
-    if (idx === -1) return null
-    let charScore = 1
-    if (prev !== -1 && idx === prev + 1) charScore += 3 // consecutive run
-    if (idx === 0)
-      charScore += 6 // string prefix
-    else if (BOUNDARY.has(hay.charAt(idx - 1))) charScore += 4 // word boundary
-    if (prev !== -1 && idx > prev + 1) charScore -= Math.min(idx - prev - 1, 3) // gap
-    if (prev === -1) charScore -= Math.min(idx, 4) // late start
-    score += charScore
-    prev = idx
-    from = idx + 1
-  }
-  return score
-}
-
-/**
- * Score one term against one text. Null = the term is not a subsequence.
- * Greedy from the first occurrence is order-sensitive (`son` in `saturn-sonnet`
- * must anchor at the second `s`), so try each occurrence of the first term char
- * (capped) and keep the best.
- */
-export function scoreTerm(term: string, text: string): number | null {
-  const needle = term.toLowerCase()
-  if (!needle) return 0
-  const hay = text.toLowerCase()
-  let best: number | null = null
-  let start = hay.indexOf(needle.charAt(0))
-  for (let tries = 0; start !== -1 && tries < MAX_STARTS; tries++) {
-    const s = scoreFrom(needle, hay, start)
-    if (s !== null && (best === null || s > best)) best = s
-    start = hay.indexOf(needle.charAt(0), start + 1)
-  }
-  return best
-}
-
-/**
- * Score a whitespace-split query against an item's fields. Every term must
- * match at least one field; each term contributes its best weighted field
- * score. Empty/blank query scores 0 (matches everything — catalog order).
- */
-export function scoreFields(query: string, fields: readonly FuzzyField[]): number | null {
-  const terms = query.trim().split(/\s+/).filter(Boolean)
-  if (!terms.length) return 0
-  let total = 0
-  for (const term of terms) {
-    let best: number | null = null
-    for (const field of fields) {
-      const s = scoreTerm(term, field.text)
-      if (s === null) continue
-      const weighted = s * (field.weight ?? 1)
-      if (best === null || weighted > best) best = weighted
-    }
-    if (best === null) return null
-    total += best
-  }
-  return total
+/** Pool entry: the item plus its precomputed fields, catalog position and the
+ *  per-term accumulated score. */
+interface Entry<T> {
+  item: T
+  at: number
+  fields: FuzzyField[]
+  total: number
 }
 
 /**
  * Filter + rank items by query. Empty query → the items in catalog order;
  * otherwise matches sorted by score (descending), ties keeping catalog order.
+ * Every whitespace-split term must fuzzy-match at least one field.
  */
 export function fuzzyFilter<T>(query: string, items: readonly T[], fieldsOf: (item: T) => FuzzyField[]): T[] {
-  if (!query.trim()) return [...items]
-  const scored: Array<{ item: T; score: number; at: number }> = []
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i] as T
-    const score = scoreFields(query, fieldsOf(item))
-    if (score !== null) scored.push({ at: i, item, score })
+  const terms = query.trim().split(/\s+/).filter(Boolean)
+  if (!terms.length) return [...items]
+
+  let pool: Entry<T>[] = items.map((item, at) => ({ at, fields: fieldsOf(item), item, total: 0 }))
+  // Items may carry different field counts (description/haystacks optional):
+  // one key per field slot, missing slots read as '' (never match).
+  const keyCount = pool.reduce((max, e) => Math.max(max, e.fields.length), 0)
+  const keys = Array.from({ length: keyCount }, (_, i) => (e: Entry<T>) => e.fields[i]?.text ?? '')
+
+  for (const term of terms) {
+    const results = fuzzysort.go(term, pool, {
+      keys,
+      // Weighted sum of per-key scores (unmatched keys score 0). Inclusion is
+      // decided by fuzzysort (≥1 key must match); this only ranks.
+      scoreFn: r => {
+        let sum = 0
+        for (let i = 0; i < r.length; i++) sum += (r[i]?.score ?? 0) * (r.obj.fields[i]?.weight ?? 1)
+        return sum
+      }
+    })
+    if (!results.length) return []
+    pool = results.map(r => {
+      r.obj.total += r.score
+      return r.obj
+    })
   }
-  scored.sort((a, b) => b.score - a.score || a.at - b.at)
-  return scored.map(s => s.item)
+
+  pool.sort((a, b) => b.total - a.total || a.at - b.at)
+  return pool.map(e => e.item)
 }
 
 /** A render row of a grouped picker: a non-selectable group header or an item.

@@ -26,7 +26,7 @@ import os
 import datetime
 import threading
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # fal_client is imported lazily — see _load_fal_client(). Pulling it
 # eagerly added ~64 ms to every CLI cold start because
@@ -116,6 +116,24 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "output_format", "enable_safety_checker",
         },
         "upscale": False,
+        # Image-to-image / edit: when the caller supplies input images we
+        # switch to the model's sibling edit endpoint. Each edit block declares
+        # the endpoint's OWN accepted-param whitelist (edit and generate
+        # endpoints diverge — e.g. flux-2-pro/edit rejects num_inference_steps),
+        # the native key the reference images go under, and whether the endpoint
+        # takes a list (``multi``) or a single image. Edits never inject an
+        # explicit image_size — FAL infers output size from the input.
+        "edit": {
+            "model": "fal-ai/flux-2/klein/9b/edit",
+            "image_key": "image_urls",
+            "multi": True,
+            "max_images": 4,
+            "supports": {
+                "prompt", "image_urls", "image_size", "num_inference_steps",
+                "num_images", "seed", "output_format", "enable_safety_checker",
+                "sync_mode",
+            },
+        },
     },
     "fal-ai/flux-2-pro": {
         "display": "FLUX 2 Pro",
@@ -143,6 +161,19 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "safety_tolerance", "sync_mode", "seed",
         },
         "upscale": True,   # Backward-compat: current default behavior.
+        "edit": {
+            "model": "fal-ai/flux-2-pro/edit",
+            "image_key": "image_urls",
+            "multi": True,
+            "max_images": 9,   # FLUX 2 Pro edit accepts up to 9 reference images.
+            # NOTE: flux-2-pro/edit rejects num_inference_steps / guidance_scale
+            # / num_images that the generate endpoint accepts.
+            "supports": {
+                "prompt", "image_urls", "image_size", "seed",
+                "safety_tolerance", "enable_safety_checker", "output_format",
+                "sync_mode",
+            },
+        },
     },
     "fal-ai/z-image/turbo": {
         "display": "Z-Image Turbo",
@@ -194,6 +225,20 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "enable_web_search", "limit_generations",
         },
         "upscale": False,
+        "edit": {
+            "model": "fal-ai/nano-banana-pro/edit",
+            "image_key": "image_urls",
+            "multi": True,
+            # Gemini 3 Pro Image edit accepts multiple reference images; cap
+            # conservatively to keep payloads (and cost) bounded.
+            "max_images": 6,
+            "supports": {
+                "prompt", "image_urls", "aspect_ratio", "resolution",
+                "num_images", "output_format", "safety_tolerance", "seed",
+                "sync_mode", "enable_web_search", "limit_generations",
+                "system_prompt",
+            },
+        },
     },
     "fal-ai/gpt-image-1.5": {
         "display": "GPT Image 1.5",
@@ -218,6 +263,17 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "background", "sync_mode",
         },
         "upscale": False,
+        "edit": {
+            "model": "fal-ai/gpt-image-1.5/edit",
+            "image_key": "image_urls",
+            "multi": True,
+            "max_images": 4,
+            "supports": {
+                "prompt", "image_urls", "image_size", "quality", "num_images",
+                "output_format", "background", "input_fidelity",
+                "mask_image_url", "sync_mode",
+            },
+        },
     },
     "fal-ai/gpt-image-2": {
         "display": "GPT Image 2",
@@ -250,6 +306,18 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             # through the shared FAL billing path.
         },
         "upscale": False,
+        "edit": {
+            # GPT Image 2's edit endpoint lives under the ``openai/`` namespace
+            # (not ``fal-ai/``), unlike its text-to-image generate endpoint.
+            "model": "openai/gpt-image-2/edit",
+            "image_key": "image_urls",
+            "multi": True,
+            "max_images": 4,
+            "supports": {
+                "prompt", "image_urls", "image_size", "quality", "num_images",
+                "output_format", "mask_url", "sync_mode",
+            },
+        },
     },
     "fal-ai/ideogram/v3": {
         "display": "Ideogram V3",
@@ -317,6 +385,21 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "num_images", "output_format", "acceleration", "seed", "sync_mode",
         },
         "upscale": False,
+        "edit": {
+            # Qwen's edit endpoint takes a SINGLE image under the singular key
+            # ``image_url`` (not a list) — unlike the flux/gpt/nano edit
+            # endpoints which take an ``image_urls`` list.
+            "model": "fal-ai/qwen-image-edit",
+            "image_key": "image_url",
+            "multi": False,
+            "max_images": 1,
+            "supports": {
+                "prompt", "image_url", "image_size", "num_inference_steps",
+                "guidance_scale", "num_images", "acceleration", "seed",
+                "output_format", "negative_prompt", "enable_safety_checker",
+                "sync_mode",
+            },
+        },
     },
     # Krea 2 — Krea's first foundation image model, day-0 partner launch on
     # fal (2026-05-27). Same model family as our direct ``plugins/image_gen/krea``
@@ -517,14 +600,20 @@ def _build_fal_payload(
     aspect_ratio: str = DEFAULT_ASPECT_RATIO,
     seed: Optional[int] = None,
     overrides: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a FAL request payload for `model_id` from unified inputs.
 
     Translates aspect_ratio into the model's native size spec (preset enum,
     aspect-ratio enum, or GPT literal string), merges model defaults, applies
     caller overrides, then filters to the model's ``supports`` whitelist.
+
+    ``meta`` may be passed explicitly for synthesized endpoints that are not in
+    the static ``FAL_MODELS`` catalog (e.g. the edit endpoint produced by
+    :func:`_resolve_edit_target`). When omitted it's looked up by ``model_id``.
     """
-    meta = FAL_MODELS[model_id]
+    if meta is None:
+        meta = FAL_MODELS[model_id]
     size_style = meta["size_style"]
     sizes = meta["sizes"]
 
@@ -539,6 +628,10 @@ def _build_fal_payload(
         payload["image_size"] = sizes[aspect]
     elif size_style == "aspect_ratio":
         payload["aspect_ratio"] = sizes[aspect]
+    elif size_style == "none":
+        # Edit endpoints infer output size from the input image — don't inject
+        # an explicit size/aspect_ratio.
+        pass
     else:
         raise ValueError(f"Unknown size_style: {size_style!r}")
 
@@ -552,6 +645,163 @@ def _build_fal_payload(
 
     supports = meta["supports"]
     return {k: v for k, v in payload.items() if k in supports}
+
+
+def _resolve_edit_target(
+    model_id: str, input_images: List[str],
+) -> Optional[tuple]:
+    """Decide whether to route this call to an image-edit endpoint.
+
+    Returns ``(edit_model_id, edit_meta_dict)`` when the active model declares
+    an ``edit`` endpoint AND the caller supplied at least one input image, or
+    ``None`` to keep the normal text-to-image path.
+
+    ``edit_meta_dict`` is a synthesized FAL_MODELS-style entry built from the
+    edit block's OWN declared ``supports`` whitelist — NOT inherited from the
+    generate endpoint, because generate and edit endpoints diverge (e.g.
+    flux-2-pro/edit rejects ``num_inference_steps``/``guidance_scale`` that the
+    generate endpoint accepts). Editing never injects an explicit output size
+    (``size_style="none"``) — FAL infers it from the input image — and never
+    chains the upscaler.
+    """
+    if not input_images:
+        return None
+    meta = FAL_MODELS.get(model_id)
+    if not meta:
+        return None
+    edit = meta.get("edit")
+    if not isinstance(edit, dict) or not edit.get("model"):
+        return None
+
+    image_key = edit.get("image_key", "image_urls")
+    supports = set(edit.get("supports") or set())
+    # The image key must always be allowed through, even if a catalog author
+    # forgot to list it explicitly.
+    supports.add(image_key)
+    edit_meta: Dict[str, Any] = {
+        "display": meta.get("display", model_id) + " (edit)",
+        # Edits don't map our abstract aspect_ratio onto a forced size — the
+        # endpoint infers output dimensions from the reference image.
+        "size_style": "none",
+        "sizes": {},
+        "defaults": dict(edit.get("defaults") or {}),
+        "supports": supports,
+        "upscale": False,
+        "_image_key": image_key,
+        "_multi": bool(edit.get("multi", True)),
+        "_max_images": edit.get("max_images"),
+    }
+    return edit["model"], edit_meta
+
+
+# ---------------------------------------------------------------------------
+# Image input (image-to-image / edit) resolution
+# ---------------------------------------------------------------------------
+#
+# FAL edit/image-to-image endpoints accept each reference image as one of:
+#   - a public http(s) URL (FAL fetches it server-side), or
+#   - a base64 ``data:`` URI (FAL decodes it inline).
+#
+# A gateway-delivered image (Telegram/Discord/WhatsApp photo) lands on disk as
+# a local cache file (see gateway adapters' ``cache_image_from_url``), so we
+# must encode local paths to a data URI before submission — FAL cannot read the
+# host filesystem. We reuse the vision tool's encoder, which already sniffs the
+# MIME type and applies a size-aware downscale so we never blow past provider
+# payload ceilings.
+#
+# Per-image hard cap mirrors the vision pipeline (20 MB); above that no major
+# backend accepts the image and we drop it with a warning rather than fail the
+# whole generation.
+
+_MAX_INPUT_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+def _resolve_input_image_ref(ref: str) -> Optional[str]:
+    """Resolve one user-supplied image reference to a FAL-submittable string.
+
+    Accepts three shapes (the same contract as ``video_generate``'s
+    ``image_url`` and ``vision_analyze``'s ``image_url``):
+
+      * ``http(s)://…``  — passed through unchanged (FAL fetches it).
+      * ``data:image/…`` — passed through unchanged (already inline base64).
+      * absolute / ``~``-relative local path — read from disk and encoded to a
+        base64 ``data:`` URI (size-aware downscale via the vision encoder).
+
+    Returns ``None`` (and logs) when the ref is empty, points at a missing
+    file, or can't be encoded — the caller skips it.
+    """
+    if not isinstance(ref, str):
+        return None
+    ref = ref.strip()
+    if not ref:
+        return None
+
+    lower = ref.lower()
+    if lower.startswith(("http://", "https://", "data:")):
+        return ref
+
+    # Treat everything else as a local filesystem path. Expand ``~`` so
+    # gateway-cached paths and user-typed home-relative paths both resolve.
+    candidate = os.path.expanduser(ref)
+    if not os.path.isfile(candidate):
+        logger.warning(
+            "image input ref is not an http(s)/data URL and no file exists at "
+            "%r — skipping", ref,
+        )
+        return None
+
+    try:
+        from pathlib import Path as _Path
+        from tools.vision_tools import (
+            _EMBED_MAX_DIMENSION,
+            _resize_image_for_vision,
+        )
+
+        # _resize_image_for_vision returns a data: URI, downscaling if the
+        # encoded payload would exceed the byte cap OR the pixel-dimension cap.
+        # Passing max_dimension matters: some edit endpoints (e.g.
+        # nano-banana-pro/edit) reject by pixel count before decode, so a
+        # small-byte-but-huge-pixel image would 422 without the dimension cap.
+        return _resize_image_for_vision(
+            _Path(candidate),
+            max_base64_bytes=_MAX_INPUT_IMAGE_BYTES,
+            max_dimension=_EMBED_MAX_DIMENSION,
+        )
+    except Exception as exc:  # noqa: BLE001 - one bad image must not kill the call
+        logger.warning("Could not encode local image input %r: %s", ref, exc)
+        return None
+
+
+def _resolve_input_images(
+    image_urls: Optional[Any], max_images: Optional[int] = None,
+) -> List[str]:
+    """Normalize the ``image_urls`` arg into a list of submittable refs.
+
+    Accepts a single string or a list of strings; resolves each via
+    :func:`_resolve_input_image_ref`; drops any that fail to resolve. When
+    ``max_images`` is set, the resolved list is truncated to that many (FAL
+    edit endpoints cap reference counts — e.g. FLUX 2 Pro allows up to 9).
+    """
+    if image_urls is None:
+        return []
+    if isinstance(image_urls, str):
+        image_urls = [image_urls]
+    if not isinstance(image_urls, (list, tuple)):
+        return []
+
+    resolved: List[str] = []
+    for ref in image_urls:
+        out = _resolve_input_image_ref(ref)
+        if out:
+            resolved.append(out)
+    if max_images is not None and max_images > 0:
+        if len(resolved) > max_images:
+            logger.info(
+                "Got %d input images but the active model caps at %d — using "
+                "the first %d", len(resolved), max_images, max_images,
+            )
+        resolved = resolved[:max_images]
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -729,13 +979,21 @@ def image_generate_tool(
     num_images: Optional[int] = None,
     output_format: Optional[str] = None,
     seed: Optional[int] = None,
+    image_urls: Optional[Any] = None,
 ) -> str:
     """Generate an image from a text prompt using the configured FAL model.
 
-    The agent-facing schema exposes only ``prompt`` and ``aspect_ratio``; the
-    remaining kwargs are overrides for direct Python callers and are filtered
-    per-model via the ``supports`` whitelist (unsupported overrides are
-    silently dropped so legacy callers don't break when switching models).
+    The agent-facing schema exposes ``prompt``, ``aspect_ratio``, and
+    ``image_urls``; the remaining kwargs are overrides for direct Python
+    callers and are filtered per-model via the ``supports`` whitelist
+    (unsupported overrides are silently dropped so legacy callers don't break
+    when switching models).
+
+    ``image_urls`` (a string or list of strings — http(s) URL, ``data:`` URI,
+    or local file path) turns this into an image-to-image / edit call when the
+    active model declares an ``edit`` endpoint. Models without an edit endpoint
+    ignore the images and fall back to text-to-image (logged), so the call
+    never hard-fails just because the user attached a reference.
 
     Returns a JSON string with ``{"success": bool, "image": url | None,
     "error": str, "error_type": str}``.
@@ -752,6 +1010,10 @@ def image_generate_tool(
             "num_images": num_images,
             "output_format": output_format,
             "seed": seed,
+            "image_urls_count": (
+                len(image_urls) if isinstance(image_urls, (list, tuple))
+                else (1 if isinstance(image_urls, str) and image_urls.strip() else 0)
+            ),
         },
         "error": None,
         "success": False,
@@ -786,16 +1048,59 @@ def image_generate_tool(
         if output_format is not None:
             overrides["output_format"] = output_format
 
+        # ---- Image-to-image / edit routing -------------------------------
+        # Resolve user-supplied reference images (url / data-uri / local path)
+        # to FAL-submittable strings. If the active model has an edit endpoint
+        # and we have at least one usable image, switch model + payload to it.
+        # Otherwise we keep text-to-image (warning if images were supplied but
+        # the model can't use them).
+        submit_model_id = model_id
+        submit_meta = meta
+        edit_target = None
+        edit_note = None
+        if image_urls is not None:
+            edit = meta.get("edit") if isinstance(meta, dict) else None
+            max_imgs = edit.get("max_images") if isinstance(edit, dict) else None
+            resolved_images = _resolve_input_images(image_urls, max_images=max_imgs)
+            if resolved_images:
+                edit_target = _resolve_edit_target(model_id, resolved_images)
+                if edit_target is not None:
+                    submit_model_id, submit_meta = edit_target
+                    image_key = submit_meta["_image_key"]
+                    if submit_meta.get("_multi", True):
+                        overrides[image_key] = resolved_images
+                    else:
+                        # Single-image endpoint (e.g. qwen): the payload key is
+                        # a bare string, not a list.
+                        overrides[image_key] = resolved_images[0]
+                else:
+                    edit_note = (
+                        f"The active model '{meta.get('display', model_id)}' "
+                        f"does not support image input/editing; generated from "
+                        f"the prompt alone. To edit an image, switch to an "
+                        f"edit-capable model via `hermes tools` → Image "
+                        f"Generation (e.g. Nano Banana Pro, FLUX 2 Pro, GPT "
+                        f"Image)."
+                    )
+                    logger.warning(
+                        "image_urls supplied but model '%s' has no edit "
+                        "endpoint — ignoring images and generating from text",
+                        model_id,
+                    )
+
         arguments = _build_fal_payload(
-            model_id, prompt, aspect_lc, seed=seed, overrides=overrides,
+            submit_model_id, prompt, aspect_lc, seed=seed, overrides=overrides,
+            meta=(submit_meta if edit_target is not None else None),
         )
 
         logger.info(
-            "Generating image with %s (%s) — prompt: %s",
-            meta.get("display", model_id), model_id, prompt[:80],
+            "%s image with %s (%s) — prompt: %s",
+            "Editing" if edit_target is not None else "Generating",
+            submit_meta.get("display", submit_model_id), submit_model_id,
+            prompt[:80],
         )
 
-        handler = _submit_fal_request(model_id, arguments=arguments)
+        handler = _submit_fal_request(submit_model_id, arguments=arguments)
         result = handler.get()
 
         generation_time = (datetime.datetime.now() - start_time).total_seconds()
@@ -807,7 +1112,7 @@ def image_generate_tool(
         if not images:
             raise ValueError("No images were generated")
 
-        should_upscale = bool(meta.get("upscale", False))
+        should_upscale = bool(submit_meta.get("upscale", False))
 
         formatted_images = []
         for img in images:
@@ -842,6 +1147,13 @@ def image_generate_tool(
             "success": True,
             "image": formatted_images[0]["url"] if formatted_images else None,
         }
+        if edit_note:
+            # Surface the "images were ignored" reason in the tool RESULT (not
+            # just a server log) so the agent can react (switch model / tell
+            # the user) instead of silently returning a from-scratch image.
+            response_data["note"] = edit_note
+        elif edit_target is not None:
+            response_data["edited"] = True
 
         debug_call_data["success"] = True
         debug_call_data["images_generated"] = len(formatted_images)
@@ -1002,10 +1314,11 @@ from tools.registry import registry, tool_error
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts. The underlying "
-        "backend (FAL, OpenAI, etc.) and model are user-configured and not "
-        "selectable by the agent. Returns either a URL or an absolute file "
-        "path in the `image` field; display it with markdown "
+        "Generate high-quality images from text prompts, or edit/transform "
+        "existing images when `image_urls` is supplied (image-to-image). The "
+        "underlying backend (FAL, OpenAI, etc.) and model are user-configured "
+        "and not selectable by the agent. Returns either a URL or an absolute "
+        "file path in the `image` field; display it with markdown "
         "![description](url-or-path) and the gateway will deliver it. When "
         "the active terminal backend has a different filesystem, successful "
         "local-file results may also include `agent_visible_image` for "
@@ -1016,13 +1329,28 @@ IMAGE_GENERATE_SCHEMA = {
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "The text prompt describing the desired image. Be detailed and descriptive.",
+                "description": "The text prompt describing the desired image. Be detailed and descriptive. When editing (image_urls set), describe the change you want.",
             },
             "aspect_ratio": {
                 "type": "string",
                 "enum": list(VALID_ASPECT_RATIOS),
                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
                 "default": DEFAULT_ASPECT_RATIO,
+            },
+            "image_urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of input images to edit or use as "
+                    "references (image-to-image). Each item is an http(s) URL, "
+                    "a data: URI, or a local file path (e.g. an image a user "
+                    "sent in chat). When supplied, the call routes to the "
+                    "active model's edit endpoint if it has one; models "
+                    "without edit support ignore the images and generate from "
+                    "the prompt alone. Reference multiple images in the prompt "
+                    "by index (e.g. 'put the person from image 1 in the scene "
+                    "from image 2')."
+                ),
             },
         },
         "required": ["prompt"],
@@ -1153,18 +1481,53 @@ def _handle_image_generate(args, **kw):
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    image_urls = args.get("image_urls")
     task_id = kw.get("task_id")
 
     # Route to a plugin-registered provider if one is active (and it's
-    # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
-    if dispatched is not None:
-        return _postprocess_image_generate_result(dispatched, task_id=task_id)
+    # not the in-tree FAL path). Plugin providers don't yet accept input
+    # images through this tool, so when the caller supplied image_urls we
+    # skip plugin dispatch and use the in-tree FAL edit path rather than
+    # silently dropping the images.
+    has_input_images = bool(
+        image_urls if isinstance(image_urls, (list, tuple)) else
+        (isinstance(image_urls, str) and image_urls.strip())
+    )
+    if not has_input_images:
+        dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+        if dispatched is not None:
+            return _postprocess_image_generate_result(dispatched, task_id=task_id)
+
+    # If a non-FAL plugin provider is configured but the caller supplied input
+    # images, we fall back to the in-tree FAL edit path (plugin providers don't
+    # accept image input through this tool yet). Note the backend switch in the
+    # result so it isn't a silent surprise.
+    reroute_note = None
+    if has_input_images:
+        configured = _read_configured_image_provider()
+        if configured and configured.lower() != "fal":
+            reroute_note = (
+                f"Image input was supplied, so the call used the built-in FAL "
+                f"edit path instead of the configured image_gen.provider="
+                f"'{configured}' (that provider does not accept image input "
+                f"through this tool)."
+            )
 
     raw = image_generate_tool(
         prompt=prompt,
         aspect_ratio=aspect_ratio,
+        image_urls=image_urls,
     )
+    if reroute_note:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                # Don't clobber an existing edit_note; append.
+                existing = payload.get("note")
+                payload["note"] = (existing + " " + reroute_note) if existing else reroute_note
+                raw = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            pass
     return _postprocess_image_generate_result(raw, task_id=task_id)
 
 

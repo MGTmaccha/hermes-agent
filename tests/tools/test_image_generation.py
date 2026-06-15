@@ -363,11 +363,24 @@ class TestAspectRatioNormalization:
 
 class TestRegistryIntegration:
 
-    def test_schema_exposes_only_prompt_and_aspect_ratio_to_agent(self, image_tool):
+    def test_schema_stays_tight_no_model_selection(self, image_tool):
         """The agent-facing schema must stay tight — model selection is a
-        user-level config choice, not an agent-level arg."""
+        user-level config choice, not an agent-level arg. The agent may pass
+        prompt, aspect_ratio, and image_urls (for image-to-image / edit), but
+        never model/provider/quality/step knobs."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
-        assert set(props.keys()) == {"prompt", "aspect_ratio"}
+        assert set(props.keys()) == {"prompt", "aspect_ratio", "image_urls"}
+        # Invariant: model-selection / tuning params never leak into the schema.
+        forbidden = {"model", "provider", "quality", "num_inference_steps",
+                     "guidance_scale", "num_images", "seed"}
+        assert not (set(props.keys()) & forbidden)
+
+    def test_image_urls_is_a_string_array(self, image_tool):
+        spec = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["image_urls"]
+        assert spec["type"] == "array"
+        assert spec["items"]["type"] == "string"
+        # Optional — never required, so text-to-image stays a one-arg call.
+        assert "image_urls" not in image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"]
 
     def test_aspect_ratio_enum_is_three_values(self, image_tool):
         enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]

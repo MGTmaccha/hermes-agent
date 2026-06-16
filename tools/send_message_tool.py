@@ -401,6 +401,24 @@ def _handle_send(args):
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
+    # Discord bot-to-bot handoffs that originate from an existing Discord
+    # thread should behave like a human posting in the specialist AI's parent
+    # channel: create a fresh thread under the resolved target channel, then
+    # send the handoff message into that thread.  Do this only for
+    # human-friendly channel targets (e.g. discord:#secretary-ai) with no
+    # explicit thread_id; explicit discord:<channel_id>:<thread_id> routes and
+    # same-thread sends must remain exact.
+    handoff_thread_id = _maybe_create_discord_handoff_thread(
+        platform_name=platform_name,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        is_explicit=is_explicit,
+        used_home_channel=used_home_channel,
+        message=mirror_text or cleaned_message,
+    )
+    if handoff_thread_id:
+        thread_id = handoff_thread_id
+
     # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
         try:
@@ -603,6 +621,90 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
             "your final response instead, or use a different target if you want an additional message."
         ),
     }
+
+
+def _discord_handoff_auto_thread_enabled() -> bool:
+    """Whether send_message should create a target-channel thread for Discord handoffs."""
+    value = os.getenv("DISCORD_HANDOFF_AUTO_THREAD", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _discord_handoff_thread_name(message: str) -> str:
+    """Build a short Discord thread name for a bot-to-bot handoff."""
+    from gateway.session_context import get_session_env
+
+    chat_name = (get_session_env("HERMES_SESSION_CHAT_NAME", "") or "").strip()
+    user_name = (get_session_env("HERMES_SESSION_USER_NAME", "") or "").strip()
+    seed = chat_name or user_name or (message or "").strip() or "Hermes handoff"
+    seed = re.sub(r"<@[!&]?\d+>", "", seed)
+    seed = re.sub(r"<#\d+>", "", seed)
+    seed = re.sub(r"\s+", " ", seed).strip() or "Hermes handoff"
+    if not seed.lower().startswith("handoff") and not seed.lower().startswith("hermes"):
+        seed = f"handoff: {seed}"
+    return seed[:80]
+
+
+def _maybe_create_discord_handoff_thread(
+    *,
+    platform_name: str,
+    chat_id: str | None,
+    thread_id: str | None,
+    is_explicit: bool,
+    used_home_channel: bool,
+    message: str,
+) -> str | None:
+    """Create a specialist-channel Discord thread for channel-name handoffs.
+
+    This intentionally does NOT copy the origin thread_id to another channel:
+    a Discord thread belongs to its parent channel, and blindly reusing an
+    origin thread for a different specialist target can produce 404 Unknown
+    Channel errors or route the handoff somewhere the receiving specialist bot
+    does not monitor.  Instead, when a Discord-thread session sends to a
+    human-friendly Discord channel target (``discord:#name``), create a new
+    handoff thread under the resolved target channel and send into that thread.
+    """
+    if platform_name != "discord" or not chat_id or thread_id:
+        return None
+    if is_explicit or used_home_channel or not _discord_handoff_auto_thread_enabled():
+        return None
+
+    try:
+        from gateway.session_context import get_session_env
+        origin_platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+        origin_thread_id = (get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
+    except Exception:
+        return None
+
+    if origin_platform != "discord" or not origin_thread_id:
+        return None
+
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return None
+        from gateway.config import Platform
+        adapter = runner.adapters.get(Platform.DISCORD)
+        create_thread = getattr(adapter, "create_handoff_thread", None)
+        if create_thread is None:
+            return None
+        from model_tools import _run_async
+        created = _run_async(create_thread(str(chat_id), _discord_handoff_thread_name(message)))
+        if created:
+            logger.info(
+                "Created Discord handoff thread %s under channel %s for origin thread %s",
+                created,
+                chat_id,
+                origin_thread_id,
+            )
+            return str(created)
+    except Exception as exc:
+        logger.warning(
+            "Discord handoff thread creation failed for channel %s; sending to parent channel: %s",
+            chat_id,
+            _sanitize_error_text(exc),
+        )
+    return None
 
 
 async def _send_via_adapter(

@@ -384,6 +384,99 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_resolved_discord_channel_handoff_creates_target_thread(self):
+        discord_cfg = SimpleNamespace(enabled=True, token="discord-token", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.DISCORD: discord_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        adapter = SimpleNamespace(create_handoff_thread=AsyncMock(return_value="thread-999"))
+        runner = SimpleNamespace(adapters={Platform.DISCORD: adapter})
+
+        def _session_env(name, default=""):
+            return {
+                "HERMES_SESSION_PLATFORM": "discord",
+                "HERMES_SESSION_THREAD_ID": "origin-thread-123",
+                "HERMES_SESSION_CHAT_NAME": "元の相談スレッド",
+                "HERMES_SESSION_USER_ID": "user-123",
+            }.get(name, default)
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value="1507763510120153129"), \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("gateway.session_context.get_session_env", side_effect=_session_env), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "discord:#secretary-ai",
+                        "message": "handoff please",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        adapter.create_handoff_thread.assert_awaited_once_with("1507763510120153129", "handoff: 元の相談スレッド")
+        send_mock.assert_awaited_once_with(
+            Platform.DISCORD,
+            discord_cfg,
+            "1507763510120153129",
+            "handoff please",
+            thread_id="thread-999",
+            media_files=[],
+            force_document=False,
+        )
+        mirror_mock.assert_called_once_with(
+            "discord",
+            "1507763510120153129",
+            "handoff please",
+            source_label="discord",
+            thread_id="thread-999",
+            user_id="user-123",
+        )
+
+    def test_explicit_discord_thread_target_does_not_create_handoff_thread(self):
+        discord_cfg = SimpleNamespace(enabled=True, token="discord-token", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.DISCORD: discord_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        adapter = SimpleNamespace(create_handoff_thread=AsyncMock(return_value="thread-999"))
+        runner = SimpleNamespace(adapters={Platform.DISCORD: adapter})
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("gateway.session_context.get_session_env", return_value="discord"), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "discord:1507763510120153129:1512391986257072238",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        adapter.create_handoff_thread.assert_not_called()
+        send_mock.assert_awaited_once_with(
+            Platform.DISCORD,
+            discord_cfg,
+            "1507763510120153129",
+            "hello",
+            thread_id="1512391986257072238",
+            media_files=[],
+            force_document=False,
+        )
+
     def test_mirror_receives_current_session_user_id(self):
         config, _telegram_cfg = _make_config()
 
